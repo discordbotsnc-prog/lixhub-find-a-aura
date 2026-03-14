@@ -1,0 +1,498 @@
+-- lix hub - Enhanced Edition (Instant Ghost Teleport Fix)
+-- LocalScript in StarterPlayerScripts
+-- Requires Workspace → Folder named "Morphs" with Parts/Models
+
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+local Window = Fluent:CreateWindow({
+    Title = "lix hub",
+    SubTitle = "Enhanced Edition",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 500),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightShift
+})
+
+local Tabs = {
+    Teleport = Window:AddTab({ Title = "Teleport", Icon = "navigation" }),
+    Movement = Window:AddTab({ Title = "Movement", Icon = "footprints" }),
+    Misc     = Window:AddTab({ Title = "Misc",     Icon = "star"       }),
+    Settings = Window:AddTab({ Title = "Settings", Icon = "settings"   })
+}
+
+local Options = Fluent.Options
+
+-- ─── Services ────────────────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player       = Players.LocalPlayer
+local flying       = false
+local noclipping   = false
+local flySpeed     = 50
+local isTeleporting = false
+local bodyVel, bodyGyro
+
+-- ─── Instant Ghost Teleport (wall-proof) ─────────────────────────────────────
+-- Anchors the HRP, warps CFrame directly, unanchors.
+-- Never travels through geometry so walls/aura hitboxes can't block it.
+local function ghostTeleport(targetCFrame, callback)
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    isTeleporting = true
+
+    -- 1. Kill all collision
+    local collideStates = {}
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            collideStates[part] = part.CanCollide
+            part.CanCollide = false
+        end
+    end
+
+    -- 2. Freeze humanoid so it doesn't fight the warp
+    hum:ChangeState(Enum.HumanoidStateType.Physics)
+
+    -- 3. Anchor → zero velocity → warp → unanchor (zero geometry travel)
+    hrp.Anchored    = true
+    hrp.Velocity    = Vector3.zero
+    hrp.RotVelocity = Vector3.zero
+    hrp.CFrame      = targetCFrame
+    task.wait()          -- one frame for physics engine to settle
+    hrp.Anchored    = false
+
+    -- 4. Resume humanoid
+    hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+    -- 5. Restore collision after a short buffer (respects global noclip)
+    task.wait(0.1)
+    if not noclipping then
+        for part, state in pairs(collideStates) do
+            if part and part.Parent then
+                part.CanCollide = state
+            end
+        end
+    end
+
+    isTeleporting = false
+    if callback then callback() end
+end
+
+-- ─── Morphs Setup ────────────────────────────────────────────────────────────
+local morphsFolder = workspace:WaitForChild("Morphs", 10)
+if not morphsFolder then
+    Fluent:Notify({ Title = "Error", Content = "Morphs folder not found!", Duration = 6 })
+    return
+end
+
+local morphList        = {}
+local currentTourIndex = 0
+local selectedMorph    = nil
+local autoTourActive   = false
+local autoTourDelay    = 3
+
+local function refreshMorphs()
+    morphList = {}
+    for _, obj in ipairs(morphsFolder:GetDescendants()) do
+        local primary = obj:IsA("BasePart") and obj
+            or (obj:IsA("Model") and obj.PrimaryPart)
+        if primary then
+            table.insert(morphList, { Name = obj.Name, CFrame = primary.CFrame })
+        end
+    end
+    local names = {}
+    for _, m in ipairs(morphList) do table.insert(names, m.Name) end
+    return names
+end
+
+local morphNames = refreshMorphs()
+
+-- ─── TELEPORT TAB ─────────────────────────────────────────────────────────────
+Tabs.Teleport:AddSection("Single Teleport")
+
+local dropdown = Tabs.Teleport:AddDropdown("morphSelect", {
+    Title   = "Select Morph",
+    Values  = morphNames,
+    Default = 1,
+    Multi   = false
+})
+
+dropdown:OnChanged(function(value)
+    for _, m in ipairs(morphList) do
+        if m.Name == value then
+            selectedMorph = m
+            Fluent:Notify({ Title = "Selected", Content = "Ready: " .. m.Name, Duration = 2 })
+            break
+        end
+    end
+end)
+
+Tabs.Teleport:AddSlider("tpHeight", {
+    Title    = "Spawn Height Offset",
+    Min      = 0,
+    Max      = 20,
+    Default  = 5,
+    Rounding = 1
+})
+
+Tabs.Teleport:AddButton({
+    Title = "Teleport to Selected",
+    Callback = function()
+        if not selectedMorph then
+            Fluent:Notify({ Title = "Error", Content = "Select a morph first!", Duration = 4 })
+            return
+        end
+        local heightOff = Options.tpHeight and Options.tpHeight.Value or 5
+        local dest = selectedMorph.CFrame + Vector3.new(0, heightOff, 0)
+        ghostTeleport(dest, function()
+            Fluent:Notify({ Title = "Arrived", Content = selectedMorph.Name, Duration = 2 })
+        end)
+    end
+})
+
+-- ─── Manual Tour ─────────────────────────────────────────────────────────────
+Tabs.Teleport:AddSection("Manual Tour")
+
+local tourLabel = Tabs.Teleport:AddParagraph({ Title = "Tour Status", Content = "Not started" })
+
+Tabs.Teleport:AddButton({
+    Title = "⏭  Next Morph",
+    Callback = function()
+        if #morphList == 0 then
+            Fluent:Notify({ Title = "Empty", Content = "No morphs found!", Duration = 4 })
+            return
+        end
+        currentTourIndex = (currentTourIndex % #morphList) + 1
+        local morph     = morphList[currentTourIndex]
+        local heightOff = Options.tpHeight and Options.tpHeight.Value or 5
+        ghostTeleport(morph.CFrame + Vector3.new(0, heightOff, 0))
+        tourLabel:Set({ Content = morph.Name .. " (" .. currentTourIndex .. "/" .. #morphList .. ")" })
+        Fluent:Notify({ Title = "Tour", Content = "→ " .. morph.Name, Duration = 2 })
+    end
+})
+
+Tabs.Teleport:AddButton({
+    Title = "⏮  Previous Morph",
+    Callback = function()
+        if #morphList == 0 then return end
+        currentTourIndex = currentTourIndex - 1
+        if currentTourIndex < 1 then currentTourIndex = #morphList end
+        local morph     = morphList[currentTourIndex]
+        local heightOff = Options.tpHeight and Options.tpHeight.Value or 5
+        ghostTeleport(morph.CFrame + Vector3.new(0, heightOff, 0))
+        tourLabel:Set({ Content = morph.Name .. " (" .. currentTourIndex .. "/" .. #morphList .. ")" })
+        Fluent:Notify({ Title = "Tour", Content = "← " .. morph.Name, Duration = 2 })
+    end
+})
+
+Tabs.Teleport:AddButton({
+    Title = "↺  Reset Tour",
+    Callback = function()
+        currentTourIndex = 0
+        tourLabel:Set({ Content = "Reset — click Next to begin" })
+    end
+})
+
+-- ─── Auto Tour ────────────────────────────────────────────────────────────────
+Tabs.Teleport:AddSection("Auto Tour")
+
+Tabs.Teleport:AddSlider("autoTourDelay", {
+    Title    = "Delay Between Morphs (s)",
+    Min      = 1,
+    Max      = 30,
+    Default  = 3,
+    Rounding = 1
+}):OnChanged(function(v) autoTourDelay = v end)
+
+Tabs.Teleport:AddToggle("autoTourToggle", {
+    Title   = "Auto Tour",
+    Default = false
+}):OnChanged(function(state)
+    autoTourActive = state
+    if state then
+        task.spawn(function()
+            while autoTourActive do
+                if #morphList == 0 then break end
+                currentTourIndex = (currentTourIndex % #morphList) + 1
+                local morph     = morphList[currentTourIndex]
+                local heightOff = Options.tpHeight and Options.tpHeight.Value or 5
+                ghostTeleport(morph.CFrame + Vector3.new(0, heightOff, 0))
+                tourLabel:Set({ Content = "[AUTO] " .. morph.Name .. " (" .. currentTourIndex .. "/" .. #morphList .. ")" })
+                task.wait(autoTourDelay)
+            end
+        end)
+    end
+end)
+
+-- ─── MOVEMENT TAB ─────────────────────────────────────────────────────────────
+Tabs.Movement:AddSection("Character Speed")
+
+Tabs.Movement:AddSlider("walkSpeed", {
+    Title    = "Walk Speed",
+    Min      = 8,
+    Max      = 500,
+    Default  = 16,
+    Rounding = 1
+}):OnChanged(function(v)
+    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if hum then hum.WalkSpeed = v end
+end)
+
+Tabs.Movement:AddSlider("jumpPower", {
+    Title    = "Jump Power",
+    Min      = 7,
+    Max      = 350,
+    Default  = 50,
+    Rounding = 1
+}):OnChanged(function(v)
+    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if hum then hum.JumpPower = v end
+end)
+
+Tabs.Movement:AddButton({
+    Title = "Reset Speed & Jump",
+    Callback = function()
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = 16; hum.JumpPower = 50 end
+        Options.walkSpeed:SetValue(16)
+        Options.jumpPower:SetValue(50)
+    end
+})
+
+-- ─── Fly ──────────────────────────────────────────────────────────────────────
+Tabs.Movement:AddSection("Fly  [RightCtrl to toggle]")
+
+Tabs.Movement:AddToggle("flyToggle", {
+    Title   = "Fly",
+    Default = false
+}):OnChanged(function(state)
+    flying = state
+    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if state then
+        bodyVel           = Instance.new("BodyVelocity")
+        bodyVel.MaxForce  = Vector3.new(9e9, 9e9, 9e9)
+        bodyVel.Velocity  = Vector3.zero
+        bodyVel.Parent    = hrp
+
+        bodyGyro           = Instance.new("BodyGyro")
+        bodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+        bodyGyro.CFrame    = hrp.CFrame
+        bodyGyro.Parent    = hrp
+
+        task.spawn(function()
+            while flying and hrp.Parent do
+                local cam  = workspace.CurrentCamera
+                local move = Vector3.zero
+                if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cam.CFrame.LookVector  end
+                if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cam.CFrame.LookVector  end
+                if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cam.CFrame.RightVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cam.CFrame.RightVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.Space)       then move += Vector3.yAxis end
+                if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.yAxis end
+
+                local speed     = Options.flySpeed and Options.flySpeed.Value or flySpeed
+                local targetVel = move.Magnitude > 0 and (move.Unit * speed) or Vector3.zero
+                bodyVel.Velocity = bodyVel.Velocity:Lerp(targetVel, 0.2)
+                bodyGyro.CFrame  = cam.CFrame
+                RunService.RenderStepped:Wait()
+            end
+            pcall(function() bodyVel:Destroy(); bodyGyro:Destroy() end)
+        end)
+    else
+        pcall(function() bodyVel:Destroy(); bodyGyro:Destroy() end)
+    end
+end)
+
+Tabs.Movement:AddSlider("flySpeed", {
+    Title    = "Fly Speed",
+    Min      = 20,
+    Max      = 500,
+    Default  = 50,
+    Rounding = 1
+}):OnChanged(function(v) flySpeed = v end)
+
+-- ─── Noclip ───────────────────────────────────────────────────────────────────
+Tabs.Movement:AddSection("Noclip  [V to toggle]")
+
+Tabs.Movement:AddToggle("noclipToggle", {
+    Title   = "Noclip",
+    Default = false
+}):OnChanged(function(v) noclipping = v end)
+
+-- Noclip loop — skips during ghost teleport which handles its own collision
+RunService.Stepped:Connect(function()
+    if noclipping and not isTeleporting and player.Character then
+        for _, part in pairs(player.Character:GetDescendants()) do
+            if part:IsA("BasePart") then part.CanCollide = false end
+        end
+    end
+end)
+
+-- Keybinds: RightCtrl = fly | V = noclip
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightControl then
+        Options.flyToggle:SetValue(not Options.flyToggle.Value)
+    elseif input.KeyCode == Enum.KeyCode.V then
+        Options.noclipToggle:SetValue(not Options.noclipToggle.Value)
+    end
+end)
+
+-- ─── MISC TAB ─────────────────────────────────────────────────────────────────
+Tabs.Misc:AddSection("Quality of Life")
+
+-- Infinite Jump
+local infiniteJump = false
+Tabs.Misc:AddToggle("infiniteJump", {
+    Title   = "Infinite Jump",
+    Default = false
+}):OnChanged(function(v) infiniteJump = v end)
+
+UserInputService.JumpRequest:Connect(function()
+    if infiniteJump then
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+-- Low Gravity
+Tabs.Misc:AddToggle("lowGravity", {
+    Title   = "Low Gravity",
+    Default = false
+}):OnChanged(function(state)
+    workspace.Gravity = state and 30 or 196.2
+end)
+
+-- Local Invisible
+Tabs.Misc:AddToggle("invisToggle", {
+    Title   = "Local Invisible (client-side only)",
+    Default = false
+}):OnChanged(function(state)
+    local char = player.Character
+    if not char then return end
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.LocalTransparencyModifier = state and 1 or 0
+        end
+    end
+end)
+
+-- Anti-AFK
+local antiAfkConn
+Tabs.Misc:AddToggle("antiAfk", {
+    Title   = "Anti-AFK",
+    Default = false
+}):OnChanged(function(state)
+    if state then
+        antiAfkConn = task.spawn(function()
+            while true do
+                task.wait(55)
+                local vp = player:FindFirstChild("PlayerGui")
+                if vp then
+                    -- Simulate a small movement to reset idle timer
+                    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+                    if hum then hum:Move(Vector3.new(0.01, 0, 0), false) end
+                end
+            end
+        end)
+    else
+        if antiAfkConn then
+            task.cancel(antiAfkConn)
+            antiAfkConn = nil
+        end
+    end
+end)
+
+-- ─── Player Teleport ──────────────────────────────────────────────────────────
+Tabs.Misc:AddSection("Player Teleport")
+
+local playerNames = {}
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= player then table.insert(playerNames, p.Name) end
+end
+
+local playerDropdown = Tabs.Misc:AddDropdown("playerSelect", {
+    Title   = "Select Player",
+    Values  = playerNames,
+    Default = 1,
+    Multi   = false
+})
+
+Tabs.Misc:AddButton({
+    Title = "Teleport to Player",
+    Callback = function()
+        local sel = Options.playerSelect and Options.playerSelect.Value
+        if not sel then return end
+        local target = Players:FindFirstChild(sel)
+        if not target or not target.Character then
+            Fluent:Notify({ Title = "Error", Content = "Player not found or no character", Duration = 4 })
+            return
+        end
+        local targetHRP = target.Character:FindFirstChild("HumanoidRootPart")
+        if not targetHRP then return end
+        ghostTeleport(targetHRP.CFrame + Vector3.new(0, 3, 0), function()
+            Fluent:Notify({ Title = "Arrived", Content = "Teleported to " .. sel, Duration = 3 })
+        end)
+    end
+})
+
+Tabs.Misc:AddButton({
+    Title = "↺  Refresh Player List",
+    Callback = function()
+        playerNames = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= player then table.insert(playerNames, p.Name) end
+        end
+        playerDropdown:SetValues(playerNames)
+        Fluent:Notify({ Title = "Refreshed", Content = #playerNames .. " players found", Duration = 3 })
+    end
+})
+
+-- ─── SETTINGS TAB ─────────────────────────────────────────────────────────────
+Tabs.Settings:AddSection("Morph List")
+
+Tabs.Settings:AddButton({
+    Title = "↺  Refresh Morph List",
+    Callback = function()
+        local newNames = refreshMorphs()
+        dropdown:SetValues(newNames)
+        Fluent:Notify({ Title = "Refreshed", Content = #newNames .. " morphs found", Duration = 4 })
+    end
+})
+
+Tabs.Settings:AddSection("Theme")
+
+Tabs.Settings:AddDropdown("themeSelect", {
+    Title   = "UI Theme",
+    Values  = { "Dark", "Light", "Aqua", "Amethyst" },
+    Default = 1,
+    Multi   = false
+}):OnChanged(function(v)
+    Fluent:SetTheme(v)
+end)
+
+Tabs.Settings:AddSection("Danger Zone")
+
+Tabs.Settings:AddButton({
+    Title = "Unload GUI",
+    Callback = function()
+        Fluent:Destroy()
+    end
+})
+
+-- ─── Startup ──────────────────────────────────────────────────────────────────
+Fluent:Notify({
+    Title   = "lix hub loaded",
+    Content = "RightShift = open | RightCtrl = fly | V = noclip | " .. #morphList .. " morphs ready",
+    Duration = 7
+})
+
+print("[lix hub] Instant ghost teleport active — walls can't block")
